@@ -28,13 +28,15 @@ from ._tuning import (
 from ._joint_profile import JOINT_FAMILIES, profile_records
 
 
-# Compiled choices for local push, cross-island scatter/gather, and cross-island DMA.
+# Compiled choices for local push, cross-island scatter/gather, cross-island DMA, and cross-island push.
 ISLAND_VARIANTS = {
-    "island_rs": (False, False, False),
-    "island_rsag": (False, True, False),
-    "island_push": (True, False, False),
-    "island_push_rsag": (True, True, False),
-    "island_hybrid_rsag": (True, True, True),
+    "island_rs": (False, False, False, False),
+    "island_rsag": (False, True, False, False),
+    "island_push": (True, False, False, False),
+    "island_push_rsag": (True, True, False, False),
+    "island_hybrid_rsag": (True, True, True, False),
+    "island_allpush_full": (True, False, False, True),
+    "island_allpush_rsag": (True, True, False, True),
 }
 
 
@@ -414,6 +416,7 @@ def _validate_query(query, device):
                 bool(native.call.get("local_push", False)),
                 bool(native.call.get("cross_island_rsag", False)),
                 bool(native.call.get("cross_island_dma", False)),
+                bool(native.call.get("cross_island_push", False)),
             ) != ISLAND_VARIANTS[name]:
                 raise ValueError(
                     "island implementation differs from its compiled protocol"
@@ -623,7 +626,7 @@ def _bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=8,
-    candidate_contract_version=13,
+    candidate_contract_version=14,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
