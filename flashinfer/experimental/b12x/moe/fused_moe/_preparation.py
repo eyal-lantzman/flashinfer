@@ -5,6 +5,7 @@ from __future__ import annotations
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -154,6 +155,8 @@ def _control_snapshot() -> FrozenMapping:
             "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
             "w4a16_fp32_topk_weights": _FP32_TOPK_WEIGHTS,
             "w4a16_a4_prefill_enabled": a4_enabled,
+            "w4a16_a4_inline_csf": a4_enabled
+            and os.environ.get("B12X_W4A16_A4_INLINE_CSF", "0") == "1",
             "w4a16_a4_prefill_terms": a4_prefill_terms() if a4_enabled else 1,
             "w4a16_a4_prefill_warps": a4_prefill_warps() if a4_enabled else 8,
             "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
@@ -494,7 +497,9 @@ class _W4A16PrimaryLaunches:
         )
 
 
-def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
+def _w4a16_primary_launches(
+    scratch, caps, csf_geometries=None
+) -> _W4A16PrimaryLaunches:
     """Compile capacity launches and exact direct routing from metadata.
 
     This intentionally uses only immutable declaration metadata and compiler
@@ -731,6 +736,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 terms=caps.w4a16_a4_prefill_terms,
                 warps=caps.w4a16_a4_prefill_warps,
                 swiglu_limit=core.swiglu_limit,
+                csf_geometries=csf_geometries if core.n % 128 == 0 else None,
             )
             a4_prefill = compile_w4a16_a4_prefill(
                 **a4_args,
@@ -1083,7 +1089,12 @@ def compile_nvfp4_csf_programs(payload, ordinal):
 
 @program_cache(scope="preparation")
 def compile_fused_moe(
-    query_payload, config_payload, weight_payload, scale_counts, ordinal
+    query_payload,
+    config_payload,
+    weight_payload,
+    scale_counts,
+    ordinal,
+    csf_geometries=None,
 ):
     """Compile and return actual primary native launch carriers from metadata."""
     query = _decode_query(query_payload)
@@ -1096,7 +1107,7 @@ def compile_fused_moe(
     caps = _lower_caps(query, config, weight_plan, torch.device("cuda", ordinal))
     scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
     w4a16 = (
-        _w4a16_primary_launches(scratch, caps)
+        _w4a16_primary_launches(scratch, caps, csf_geometries)
         if scratch.launch_plan.implementation == "w4a16" and not scratch.full_rotation
         else None
     )
@@ -1177,7 +1188,20 @@ class _FusedMoeState:
     ) -> bool:
         if not 0 < int(num_tokens) <= self.scratch.caps.max_tokens:
             raise ValueError("token count exceeds prepared MoE capacity")
-        return self.experts._impl.nvfp4_csf is not None
+        if self.experts._impl.nvfp4_csf is None:
+            return False
+        if a4_prefill and self.w4a16_launches and self.w4a16_launches.a4_prefill:
+            if self.w4a16_launches.a4_prefill.csf_inline_scales:
+                launch = self._a4_launch_for(
+                    num_tokens=num_tokens,
+                    a4_prefill=a4_prefill,
+                    route_ids_dtype=route_ids_dtype,
+                    has_route_map=has_route_map,
+                    collect_activation_amax=collect_activation_amax,
+                    scales_expanded=scales_expanded,
+                )
+                return launch is None
+        return True
 
     def bind(self, **kwargs):
         experts = kwargs.pop("experts", self.experts)
@@ -1366,6 +1390,11 @@ def plan(
             lsc.bitmap_routes,
         )
     )
+    inline_geometries = None
+    if controls["w4a16_a4_inline_csf"] and lsc is not None:
+        geometries = (lsc.first.geometry, lsc.second.geometry)
+        if all(len(plane) == 11 and plane[3] == 9 for plane in geometries):
+            inline_geometries = geometries
     expansions = (
         {}
         if scale_expansion is None
@@ -1425,6 +1454,7 @@ def plan(
                     weight_payload,
                     scale_counts,
                     device.ordinal,
+                    inline_geometries,
                 ),
                 CompileJob.create(
                     "b12x.moe.fused_moe._preparation:compile_route_topk",
@@ -1463,6 +1493,7 @@ def plan(
                 weight_payload,
                 scale_counts,
                 device.ordinal,
+                inline_geometries,
             )
             scratch = replace(
                 plan_tp_moe_scratch(caps, prewarm_launches=False),

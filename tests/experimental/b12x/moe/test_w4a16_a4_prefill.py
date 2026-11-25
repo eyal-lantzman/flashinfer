@@ -724,8 +724,16 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
         (320, 2, 3072, 8, 1537, True),
     ],
 )
+@pytest.mark.parametrize("inline_enabled", [False, True])
 def test_a4_csf_scale_readers_preserve_dense_graph_output(
-    intermediate_size, terms, capacity, warps, tokens, ready, monkeypatch
+    intermediate_size,
+    terms,
+    capacity,
+    warps,
+    tokens,
+    ready,
+    inline_enabled,
+    monkeypatch,
 ):
     """Scale expansion preserves native arithmetic and caller stream ordering."""
     import numpy as np
@@ -738,7 +746,9 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
     device = require_b12x()
     _env(monkeypatch, True, terms)
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", str(warps))
+    monkeypatch.setenv("B12X_W4A16_A4_INLINE_CSF", str(int(inline_enabled)))
     I = intermediate_size
+    inline = inline_enabled and I % 128 == 0
     case = _make_case(17, I)
     case["plan"] = moe.plan_weights(
         source=case["plan"].source,
@@ -781,20 +791,27 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
             a4_prefill=True,
             scales_expanded=ready,
         )
+        assert moe.uses_expanded_nvfp4_scales(
+            plan, num_tokens=tokens, a4_prefill=True
+        ) == (owner._impl.nvfp4_csf is not None and not inline)
+        assert moe.uses_expanded_nvfp4_scales(
+            plan, num_tokens=tokens, a4_prefill=False
+        ) == (owner._impl.nvfp4_csf is not None)
         bindings.append(binding)
         outputs.append(output)
         scratches.append(scratch)
     launches = [binding.a4_prefill_launches for binding in bindings]
-    assert launches[0].fc1 is launches[1].fc1
-    assert launches[0].fc2 is launches[1].fc2
+    assert launches[1].csf_inline_scales is inline
+    assert (launches[0].fc1 is launches[1].fc1) == (not inline)
+    assert (launches[0].fc2 is launches[1].fc2) == (not inline)
     packed = owners[1]._impl.representation.value
     scale_scratch = (packed.w13_scale, packed.w2_scale)
-    consumes_expanded = ready
+    consumes_expanded = ready and not inline
 
     def reject_expansion(*args, **kwargs):
         raise AssertionError("Caller-expanded scales must skip per-call expansion")
 
-    if ready:
+    if ready or inline:
         monkeypatch.setattr(Nvfp4CsfDecoder, "decode", reject_expansion)
     for buffer in scale_scratch:
         buffer.view(torch.uint8).fill_(0x7F)
@@ -831,7 +848,12 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
                 assert torch.cuda.max_memory_allocated() == allocated
                 assert pointers == tuple(t.data_ptr() for t in stable)
                 torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
-                if not consumes_expanded:
+                if inline:
+                    assert all(
+                        torch.all(buffer.view(torch.uint8) == 0x7F)
+                        for buffer in scale_scratch
+                    )
+                elif not consumes_expanded:
                     assert all(
                         not torch.all(buffer.view(torch.uint8) == 0x7F)
                         for buffer in scale_scratch
