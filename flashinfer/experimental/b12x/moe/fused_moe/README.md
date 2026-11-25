@@ -18,6 +18,12 @@ of all-one placeholder scales retain W4A16. The shared input global scale is
 the minimum across experts. Intermediate scales remain per expert. Ordinary
 A4 weight preparation retains its per-expert scales.
 
+On compact NVFP4-CSF weights, set `B12X_W4A16_A4_INLINE_CSF=1` before
+preparing plans to read compressed scales in the A4 GEMMs. Both projections
+must use native codes with compact group records and a 128-aligned per-rank
+intermediate width. Other layouts and A16 decode continue to use expanded
+scales. The default is off.
+
 Supported weights use packed ModelOpt NVFP4 with ordinary or compressed
 NVFP4-CSF block scales, BF16 input/output, SiLU gating, hidden size divisible
 by 256, and intermediate size divisible by 64. FC1 masks the unused half of

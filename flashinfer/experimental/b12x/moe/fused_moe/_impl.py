@@ -13253,8 +13253,16 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         and binding.implementation == "micro"
         and topk_ids.numel() > 0
     )
-    if experts.nvfp4_csf is not None and not (
-        binding.scales_expanded and not csf_reset_barriers
+    inline_scales = None
+    if a4_launches is not None and a4_launches.csf_inline_scales:
+        inline_scales = (
+            experts.nvfp4_csf.first.scales,
+            experts.nvfp4_csf.second.scales,
+        )
+    if (
+        experts.nvfp4_csf is not None
+        and inline_scales is None
+        and not (binding.scales_expanded and not csf_reset_barriers)
     ):
         barriers = (
             (
@@ -13535,6 +13543,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 intermediate_cache2=intermediate_cache2,
                 output=scatter_output,
                 launches=a4_launches,
+                inline_scales=inline_scales,
             )
         result = run_w4a16_moe(
             a,
